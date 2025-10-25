@@ -1,9 +1,9 @@
-# face_privacy_fast_fixed.py
-# StealthZone — Fixed real-time, fast, fullscreen, on-screen interactive settings
-# - MediaPipe every frame on small detection frame (320x240)
-# - Async OpenCV DNN fallback worker
-# - Non-blocking settings overlay (camera + detection continue)
-# - No blocking waitKey calls that freeze detection
+# face_privacy_interactive.py
+# StealthZone — Interactive real-time face privacy manager
+# - MediaPipe face detection + OpenCV DNN fallback
+# - Real-time face recognition (optional)
+# - Dynamic primary face selection
+# - Interactive settings overlay
 
 import cv2
 import mediapipe as mp
@@ -12,6 +12,7 @@ import time
 import math
 import threading
 from collections import deque
+from face_registry import load_registry, find_match, get_face_embedding
 
 # ----------------------------
 # CONFIG
@@ -27,6 +28,7 @@ DETECT_H = 240
 
 CLAHE_EVERY_N_FRAMES = 10
 DNN_RUN_EVERY_N_FRAMES = 8
+FACE_REC_EVERY_N_FRAMES = 5 # Run face recognition less frequently
 ROTATION_ANGLES = [0, -8, 8]   # small-angles for side faces
 SMOOTHING_ALPHA = 0.6
 FACE_MIN_SIZE = 16
@@ -39,6 +41,21 @@ MAX_PRIMARY_ALLOW = 8
 cv2.setUseOptimized(True)
 
 # ----------------------------
+# STATE
+# ----------------------------
+class AppState:
+    def __init__(self):
+        self.blur_type = "gaussian"
+        self.blur_intensity = 5  # 1-10
+        self.primary_detection_mode = "auto" # auto, manual
+        self.show_settings = False
+        self.show_hud = True
+        self.manual_primary_id = None
+        self.face_registry = load_registry()
+
+state = AppState()
+
+# ----------------------------
 # HELPERS
 # ----------------------------
 def clamp_odd(x):
@@ -46,6 +63,7 @@ def clamp_odd(x):
     if x % 2 == 0:
         x += 1
     return max(1, x)
+
 
 def rect_area(box):
     x1,y1,x2,y2 = box
@@ -381,7 +399,28 @@ try:
                     new_faces_state[fid] = st
         faces_state = new_faces_state
 
-        # primary selection (largest/center)
+        # Face recognition for registered users (every few frames)
+        if frame_idx % FACE_REC_EVERY_N_FRAMES == 0 and state.face_registry:
+            for fid, st in faces_state.items():
+                # Only check if not already recognized or periodically re-check
+                if st.get('registered_name') is None or frame_idx % (FACE_REC_EVERY_N_FRAMES * 10) == 0:
+                    x1, y1, x2, y2 = map(int, st.get("smooth_box", st["box"]))
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(full_w, x2), min(full_h, y2)
+                    
+                    if (x2 - x1) > FACE_MIN_SIZE and (y2 - y1) > FACE_MIN_SIZE:
+                        face_crop = full_frame[y1:y2, x1:x2]
+                        
+                        # Get embedding using DeepFace
+                        embedding = get_face_embedding(face_crop)
+                        
+                        if embedding is not None:
+                            name, distance = find_match(embedding, state.face_registry)
+                            st['registered_name'] = name  # Will be None if no match
+                            if name:
+                                print(f"[INFO] Recognized registered face: {name} (distance: {distance:.3f})")
+
+        # primary selection (largest/center + registered faces)
         face_list=[]
         for fid, st in faces_state.items():
             sb = tuple(map(int, st.get("smooth_box", st["box"])))
@@ -389,6 +428,11 @@ try:
             cx,cy = box_center(sb)
             center_dist = math.hypot(cx - full_w/2.0, cy - full_h/2.0)
             priority = area - (center_dist * 50.0)
+            
+            # Boost priority for registered faces
+            if st.get('registered_name') is not None:
+                priority += 1e6  # Ensure registered faces are always primary
+            
             face_list.append((fid, st, priority))
         face_list_sorted = sorted(face_list, key=lambda x: x[2], reverse=True)
         ids_ordered = [fid for fid, st, _ in face_list_sorted]
@@ -408,7 +452,9 @@ try:
             x1,y1 = max(0,x1), max(0,y1); x2,y2 = min(full_w-1,x2), min(full_h-1,y2)
             if fid in primary_ids:
                 cv2.rectangle(full_frame, (x1,y1), (x2,y2), (0,200,0), 2)
-                cv2.putText(full_frame, f"P id:{fid}", (x1, y1-8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,200,0),2)
+                # Show registered name if available
+                label = st.get('registered_name') or f"P id:{fid}"
+                cv2.putText(full_frame, label, (x1, y1-8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,200,0),2)
             else:
                 roi = full_frame[y1:y2, x1:x2]
                 if roi.size == 0: continue

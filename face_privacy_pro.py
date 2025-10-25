@@ -79,6 +79,8 @@ class AppState:
     def __init__(self):
         self.blur_type = "pixelate"  # OPTIMIZED: pixelate is much faster than gaussian
         self.blur_intensity = 5  # 1-10
+        self.anti_kyc_mode = False  # NEW: Anti-KYC distortion mode
+        self.distortion_intensity = 5  # 1-10 for distortion strength
         self.show_settings = True
         self.face_recognition_enabled = FACE_REC_AVAILABLE
         self.capture_mode = False  # Registration mode
@@ -205,6 +207,82 @@ def apply_blur(frame, x1, y1, x2, y2, blur_type, intensity):
     
     return frame
 
+def apply_anti_kyc_distortion(frame, x1, y1, x2, y2, intensity=5):
+    """
+    Apply subtle face distortion that defeats automated recognition (V-KYC)
+    while remaining visually similar to humans.
+    
+    Techniques:
+    - Subtle geometric warping (eyes, nose, mouth displacement)
+    - Micro-texture noise injection
+    - Biometric feature perturbation
+    """
+    roi = frame[y1:y2, x1:x2]
+    if roi.size == 0 or roi.shape[0] < 50 or roi.shape[1] < 50:
+        return frame
+    
+    h, w = roi.shape[:2]
+    
+    try:
+        # Create a copy to work with
+        distorted = roi.copy()
+        
+        # 1. Subtle geometric warping using mesh distortion
+        # Create displacement maps for subtle warping
+        strength = intensity * 0.3  # Keep it subtle
+        
+        # Generate smooth random displacement fields
+        map_x = np.zeros((h, w), dtype=np.float32)
+        map_y = np.zeros((h, w), dtype=np.float32)
+        
+        # Create grid coordinates
+        for i in range(h):
+            for j in range(w):
+                map_x[i, j] = j
+                map_y[i, j] = i
+        
+        # Add subtle sinusoidal warping (biometric features get displaced)
+        # Eye region displacement (top 40% of face)
+        eye_region_y = int(h * 0.4)
+        map_x[:eye_region_y, :] += strength * np.sin(np.linspace(0, 4*np.pi, w))
+        map_y[:eye_region_y, :] += strength * 0.5 * np.cos(np.linspace(0, 2*np.pi, eye_region_y))[:, np.newaxis]
+        
+        # Nose/mouth region displacement (middle to bottom)
+        nose_start = int(h * 0.35)
+        nose_end = int(h * 0.75)
+        map_x[nose_start:nose_end, :] += strength * 0.7 * np.cos(np.linspace(0, 3*np.pi, w))
+        
+        # Apply the warp
+        distorted = cv2.remap(distorted, map_x, map_y, cv2.INTER_LINEAR)
+        
+        # 2. Add micro-texture noise to disrupt feature extraction
+        # This affects CNN-based recognition without being visible
+        noise_strength = intensity * 0.8
+        noise = np.random.normal(0, noise_strength, distorted.shape).astype(np.float32)
+        distorted = np.clip(distorted.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+        
+        # 3. Subtle color channel perturbation (defeats some liveness detection)
+        if intensity >= 5:
+            # Very subtle channel shift
+            b, g, r = cv2.split(distorted)
+            b = np.roll(b, 1, axis=0)  # Shift blue channel slightly
+            r = np.roll(r, -1, axis=1)  # Shift red channel slightly
+            distorted = cv2.merge([b, g, r])
+        
+        # 4. Slight contrast adjustment in specific regions (affects edge detection)
+        # Target eye and mouth regions
+        alpha = 1.0 + (intensity * 0.02)  # Subtle contrast boost
+        distorted = cv2.convertScaleAbs(distorted, alpha=alpha, beta=0)
+        
+        # Place distorted ROI back into frame
+        frame[y1:y2, x1:x2] = distorted
+        
+    except Exception as e:
+        print(f"[WARN] Distortion failed: {e}")
+        pass
+    
+    return frame
+
 def draw_settings_overlay(frame, state, fps, total_faces, registered_count):
     """Draw settings and info overlay."""
     if not state.show_settings:
@@ -214,7 +292,7 @@ def draw_settings_overlay(frame, state, fps, total_faces, registered_count):
     
     # Semi-transparent background
     overlay = frame.copy()
-    cv2.rectangle(overlay, (10, 10), (400, 230), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (10, 10), (400, 270), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
     
     y_offset = 35
@@ -235,6 +313,12 @@ def draw_settings_overlay(frame, state, fps, total_faces, registered_count):
     cv2.putText(frame, f"Recognition: {rec_status} ({len(state.registry)} enrolled)", 
                 (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, rec_color, 1)
     
+    y_offset += 25
+    kyc_status = "ENABLED" if state.anti_kyc_mode else "DISABLED"
+    kyc_color = (0, 255, 255) if state.anti_kyc_mode else (128, 128, 128)
+    cv2.putText(frame, f"Anti-KYC: {kyc_status} (intensity {state.distortion_intensity}/10)", 
+                (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, kyc_color, 1)
+    
     y_offset += 30
     cv2.putText(frame, "CONTROLS:", (20, y_offset), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 200, 255), 1)
@@ -244,6 +328,8 @@ def draw_settings_overlay(frame, state, fps, total_faces, registered_count):
         "F: Toggle recognition",
         "B: Blur intensity (curr: {})".format(state.blur_intensity),
         "M: Blur mode (curr: {})".format(state.blur_type),
+        "K: Toggle Anti-KYC distortion",
+        "D: Distortion intensity (curr: {})".format(state.distortion_intensity),
         "T: Toggle settings",
         "C: Capture photo",
         "Q/ESC: Quit"
@@ -666,8 +752,13 @@ try:
                            cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 0, 0), 2)
             
             else:
-                # --- IT'S AN UNKNOWN FACE, BLUR IT ---
-                frame = apply_blur(frame, x1, y1, x2, y2, state.blur_type, state.blur_intensity)
+                # --- IT'S AN UNKNOWN FACE, BLUR/DISTORT IT ---
+                if state.anti_kyc_mode:
+                    # Apply anti-KYC distortion instead of blur
+                    frame = apply_anti_kyc_distortion(frame, x1, y1, x2, y2, state.distortion_intensity)
+                else:
+                    # Standard blur mode
+                    frame = apply_blur(frame, x1, y1, x2, y2, state.blur_type, state.blur_intensity)
                 blurred_count += 1
                 
                 color = (0, 120, 255)
@@ -865,6 +956,22 @@ try:
         
         elif key == ord('t'):  # Toggle settings (changed from 's' to 't')
             state.show_settings = not state.show_settings
+        
+        elif key == ord('k'):  # Toggle Anti-KYC distortion mode
+            state.anti_kyc_mode = not state.anti_kyc_mode
+            if state.anti_kyc_mode:
+                print(f"\n[ANTI-KYC MODE ENABLED] - Unknown faces will be distorted (Intensity: {state.distortion_intensity}/10)")
+                print("[INFO] Distortion defeats automated V-KYC while appearing visually normal")
+            else:
+                print(f"\n[ANTI-KYC MODE DISABLED] - Standard blur mode active")
+        
+        elif key == ord('d'):  # Cycle distortion intensity
+            state.distortion_intensity = (state.distortion_intensity % 10) + 1
+            print(f"[INFO] Distortion intensity set to {state.distortion_intensity}/10")
+            if state.anti_kyc_mode:
+                print(f"       Active in current frame - unknown faces will use new intensity")
+            else:
+                print(f"       Press 'K' to enable Anti-KYC mode")
         
         elif key == ord('r'):  # Registration mode
             if FACE_REC_AVAILABLE:
