@@ -31,6 +31,7 @@ import mediapipe as mp
 import numpy as np
 import time
 import math
+import json
 from collections import deque
 import os
 from datetime import datetime
@@ -47,7 +48,7 @@ except Exception as e:
 # ----------------------------
 # CONFIG
 # ----------------------------
-USE_OPENCV_DNN = False  # OPTIMIZED: Disable redundant detector for better FPS
+USE_OPENCV_DNN = False  # OPTIMIZED: Disable redundant detector
 DNN_PROTO = "deploy.prototxt.txt"
 DNN_MODEL = "res10_300x300_ssd_iter_140000.caffemodel"
 
@@ -56,14 +57,16 @@ FRAME_HEIGHT = 540
 DETECT_W = 240  # Even smaller detection for speed
 DETECT_H = 180
 
-PROCESS_EVERY_N_FRAMES = 3  # FIXED: More frequent detection for better tracking accuracy
-FACE_REC_EVERY_N_FRAMES = 5  # Recognition runs more frequently for better accuracy
-ROTATION_ANGLES = [0]  # Single angle for maximum speed - MediaPipe is already robust
-SMOOTHING_ALPHA = 0.7  # FIXED: Less smoothing for more responsive tracking
+# --- SPEED FIX ---
+PROCESS_EVERY_N_FRAMES = 5  # CHANGED: Detect less often (was 3)
+FACE_REC_EVERY_N_FRAMES = 5
+ROTATION_ANGLES = [0]
+SMOOTHING_ALPHA = 0.8  # CHANGED: More smoothing for a less "laggy" box (was 0.7)
+# --- END SPEED FIX ---
 FACE_MIN_SIZE = 15
-BLUR_MAX_KSIZE = 71  # Reduced max for faster blur
+BLUR_MAX_KSIZE = 71
 BLUR_MIN_KSIZE = 11
-KEEP_TRACK_FRAMES = 15  # FIXED: Shorter timeout so ghost boxes disappear faster
+KEEP_TRACK_FRAMES = 15  # This is already correct
 MAX_HISTORY = 30
 
 # Recognition settings
@@ -71,6 +74,39 @@ RECOGNITION_CONFIDENCE_THRESHOLD = 0.6  # Increased for better accuracy
 MIN_CAPTURES_FOR_REGISTRATION = 5
 
 cv2.setUseOptimized(True)
+
+# ----------------------------
+# WINDOW SETTINGS PERSISTENCE
+# ----------------------------
+WINDOW_SETTINGS_FILE = "window_settings.json"
+
+def save_window_settings(window_name):
+    """Save window position and size."""
+    try:
+        rect = cv2.getWindowImageRect(window_name)
+        if rect[2] > 0 and rect[3] > 0:  # Valid dimensions
+            settings = {
+                "x": rect[0],
+                "y": rect[1],
+                "width": rect[2],
+                "height": rect[3]
+            }
+            with open(WINDOW_SETTINGS_FILE, 'w') as f:
+                json.dump(settings, f)
+    except Exception as e:
+        pass  # Silently fail if window settings can't be saved
+
+def load_window_settings():
+    """Load saved window position and size."""
+    try:
+        if os.path.exists(WINDOW_SETTINGS_FILE):
+            with open(WINDOW_SETTINGS_FILE, 'r') as f:
+                settings = json.load(f)
+            return settings
+    except Exception as e:
+        pass
+    return None
+
 
 # ----------------------------
 # APP STATE
@@ -81,6 +117,7 @@ class AppState:
         self.blur_intensity = 5  # 1-10
         self.anti_kyc_mode = False  # NEW: Anti-KYC distortion mode
         self.distortion_intensity = 5  # 1-10 for distortion strength
+        self.normal_mode = False  # NEW: Normal mode - no blur, no distortion
         self.show_settings = True
         self.face_recognition_enabled = FACE_REC_AVAILABLE
         self.capture_mode = False  # Registration mode
@@ -228,18 +265,13 @@ def apply_anti_kyc_distortion(frame, x1, y1, x2, y2, intensity=5):
         distorted = roi.copy()
         
         # 1. Subtle geometric warping using mesh distortion
-        # Create displacement maps for subtle warping
         strength = intensity * 0.3  # Keep it subtle
         
-        # Generate smooth random displacement fields
-        map_x = np.zeros((h, w), dtype=np.float32)
-        map_y = np.zeros((h, w), dtype=np.float32)
-        
-        # Create grid coordinates
-        for i in range(h):
-            for j in range(w):
-                map_x[i, j] = j
-                map_y[i, j] = i
+        # --- OPTIMIZATION ---
+        # Replace slow python for-loops with fast numpy mgrid
+        # This creates the map_x and map_y coordinates instantly.
+        map_y, map_x = np.mgrid[0:h, 0:w].astype(np.float32)
+        # --- END OPTIMIZATION ---
         
         # Add subtle sinusoidal warping (biometric features get displaced)
         # Eye region displacement (top 40% of face)
@@ -256,25 +288,21 @@ def apply_anti_kyc_distortion(frame, x1, y1, x2, y2, intensity=5):
         distorted = cv2.remap(distorted, map_x, map_y, cv2.INTER_LINEAR)
         
         # 2. Add micro-texture noise to disrupt feature extraction
-        # This affects CNN-based recognition without being visible
         noise_strength = intensity * 0.8
         noise = np.random.normal(0, noise_strength, distorted.shape).astype(np.float32)
         distorted = np.clip(distorted.astype(np.float32) + noise, 0, 255).astype(np.uint8)
         
-        # 3. Subtle color channel perturbation (defeats some liveness detection)
+        # 3. Subtle color channel perturbation
         if intensity >= 5:
-            # Very subtle channel shift
             b, g, r = cv2.split(distorted)
-            b = np.roll(b, 1, axis=0)  # Shift blue channel slightly
-            r = np.roll(r, -1, axis=1)  # Shift red channel slightly
+            b = np.roll(b, 1, axis=0)
+            r = np.roll(r, -1, axis=1)
             distorted = cv2.merge([b, g, r])
         
-        # 4. Slight contrast adjustment in specific regions (affects edge detection)
-        # Target eye and mouth regions
-        alpha = 1.0 + (intensity * 0.02)  # Subtle contrast boost
+        # 4. Slight contrast adjustment
+        alpha = 1.0 + (intensity * 0.02)
         distorted = cv2.convertScaleAbs(distorted, alpha=alpha, beta=0)
         
-        # Place distorted ROI back into frame
         frame[y1:y2, x1:x2] = distorted
         
     except Exception as e:
@@ -292,7 +320,7 @@ def draw_settings_overlay(frame, state, fps, total_faces, registered_count):
     
     # Semi-transparent background
     overlay = frame.copy()
-    cv2.rectangle(overlay, (10, 10), (400, 270), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (10, 10), (400, 290), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
     
     y_offset = 35
@@ -314,10 +342,17 @@ def draw_settings_overlay(frame, state, fps, total_faces, registered_count):
                 (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, rec_color, 1)
     
     y_offset += 25
-    kyc_status = "ENABLED" if state.anti_kyc_mode else "DISABLED"
-    kyc_color = (0, 255, 255) if state.anti_kyc_mode else (128, 128, 128)
-    cv2.putText(frame, f"Anti-KYC: {kyc_status} (intensity {state.distortion_intensity}/10)", 
-                (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, kyc_color, 1)
+    # Show current privacy mode
+    if state.normal_mode:
+        mode_text = "Mode: NORMAL (no privacy)"
+        mode_color = (255, 165, 0)  # Orange warning
+    elif state.anti_kyc_mode:
+        mode_text = f"Mode: ANTI-KYC (intensity {state.distortion_intensity}/10)"
+        mode_color = (0, 255, 255)  # Cyan
+    else:
+        mode_text = f"Mode: BLUR ({state.blur_type}, intensity {state.blur_intensity})"
+        mode_color = (200, 200, 200)  # Gray
+    cv2.putText(frame, mode_text, (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, mode_color, 1)
     
     y_offset += 30
     cv2.putText(frame, "CONTROLS:", (20, y_offset), 
@@ -326,6 +361,7 @@ def draw_settings_overlay(frame, state, fps, total_faces, registered_count):
     controls = [
         "R: Register new face",
         "F: Toggle recognition",
+        "N: Normal mode (no privacy)",
         "B: Blur intensity (curr: {})".format(state.blur_intensity),
         "M: Blur mode (curr: {})".format(state.blur_type),
         "K: Toggle Anti-KYC distortion",
@@ -444,8 +480,27 @@ if not cap.isOpened():
     print("[ERROR] Cannot open webcam")
     exit()
 
+# ----------------------------
+# CREATE RESIZABLE WINDOW
+# ----------------------------
+WINDOW_NAME = "StealthZone Pro - Press Q to quit"
+cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)  # Make window resizable
+
+# Load saved window settings (position and size)
+saved_settings = load_window_settings()
+if saved_settings:
+    try:
+        cv2.resizeWindow(WINDOW_NAME, saved_settings['width'], saved_settings['height'])
+        cv2.moveWindow(WINDOW_NAME, saved_settings['x'], saved_settings['y'])
+        print(f"[INFO] Restored window position and size")
+    except Exception as e:
+        cv2.resizeWindow(WINDOW_NAME, FRAME_WIDTH, FRAME_HEIGHT)  # Fallback to default
+else:
+    cv2.resizeWindow(WINDOW_NAME, FRAME_WIDTH, FRAME_HEIGHT)  # Set initial size
+
 print("[INFO] StealthZone Pro started successfully!")
 print(f"[INFO] Face recognition: {'ENABLED' if FACE_REC_AVAILABLE else 'DISABLED'}")
+print("[INFO] Window is resizable - drag corners to resize")
 
 frame_idx = 0
 t_last = time.time()
@@ -632,17 +687,30 @@ try:
                 
                 st["last_recognition_attempt"] = frame_idx
                 
-                x1, y1, x2, y2 = map(int, st.get("smooth_box", st["box"]))
+                # --- THIS IS THE ACCURACY FIX ---
+                # We must create a "scene patch" just like we do for registration
+                # This ensures get_face_embedding (which uses app.get()) can find the face.
+                x1_box, y1_box, x2_box, y2_box = map(int, st.get("smooth_box", st["box"]))
+                face_w = x2_box - x1_box
+                face_h = y2_box - y1_box
                 
-                # Use a larger margin for better recognition
-                face_w = x2 - x1
-                margin = int(face_w * 0.3)
-                x1m = max(0, x1 - margin)
-                y1m = max(0, y1 - margin)
-                x2m = min(w, x2 + margin)
-                y2m = min(h, y2 + margin)
+                # 1. Find the center of the face
+                center_x = (x1_box + x2_box) // 2
+                center_y = (y1_box + y2_box) // 2
                 
-                face_img = frame[y1m:y2m, x1m:x2m]
+                # 2. Determine the size of our crop (e.g., 3.0x the face size)
+                crop_size = int(max(face_w, face_h) * 3.0) 
+                
+                # 3. Calculate new x1, y1, x2, y2 for the *crop*
+                x1p = max(0, center_x - crop_size // 2)
+                y1p = max(0, center_y - crop_size // 2)
+                x2p = min(w, center_x + crop_size // 2)
+                y2p = min(h, center_y + crop_size // 2)
+                
+                # 4. Grab the image from the main frame
+                # IMPORTANT: Use the clean_frame to avoid re-recognizing a blurred face
+                face_img = clean_frame[y1p:y2p, x1p:x2p]
+                # --- END OF FIX ---
                 
                 match_name = None # Default to no match
                 if face_img.size > 0 and face_img.shape[0] > 40 and face_img.shape[1] > 40:
@@ -735,7 +803,7 @@ try:
                     # --- IT'S A RECOGNIZED FACE ---
                     color = (0, 255, 0)  # Bright green for recognized
                     # Get name from the face's state dictionary
-                    label = f"✓ {st.get('registered_name')}"
+                    label = f"{st.get('registered_name')}"
                 else:
                     # --- IT'S THE REGISTRATION TARGET ---
                     color = (255, 200, 0) # Bright blue for "Registering"
@@ -752,14 +820,18 @@ try:
                            cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 0, 0), 2)
             
             else:
-                # --- IT'S AN UNKNOWN FACE, BLUR/DISTORT IT ---
-                if state.anti_kyc_mode:
+                # --- IT'S AN UNKNOWN FACE, BLUR/DISTORT/SHOW IT ---
+                if state.normal_mode:
+                    # Normal mode - no processing, just show the face
+                    pass  # Don't blur or distort
+                elif state.anti_kyc_mode:
                     # Apply anti-KYC distortion instead of blur
                     frame = apply_anti_kyc_distortion(frame, x1, y1, x2, y2, state.distortion_intensity)
+                    blurred_count += 1
                 else:
                     # Standard blur mode
                     frame = apply_blur(frame, x1, y1, x2, y2, state.blur_type, state.blur_intensity)
-                blurred_count += 1
+                    blurred_count += 1
                 
                 color = (0, 120, 255)
                 label = "Unknown"
@@ -806,7 +878,7 @@ try:
         # ----------------------------
         # DISPLAY
         # ----------------------------
-        cv2.imshow("StealthZone Pro - Press Q to quit", frame)
+        cv2.imshow(WINDOW_NAME, frame)
         
         # ----------------------------
         # KEYBOARD CONTROLS
@@ -957,7 +1029,21 @@ try:
         elif key == ord('t'):  # Toggle settings (changed from 's' to 't')
             state.show_settings = not state.show_settings
         
+        elif key == ord('n'):  # Toggle Normal mode (no blur, no distortion)
+            state.normal_mode = not state.normal_mode
+            if state.normal_mode:
+                print(f"\n[NORMAL MODE ENABLED] - Unknown faces will be shown without blur or distortion")
+                print("[INFO] All faces visible in original form")
+                # Disable other modes when normal mode is on
+                state.anti_kyc_mode = False
+            else:
+                print(f"\n[NORMAL MODE DISABLED] - Privacy protection active")
+                print("[INFO] Unknown faces will be blurred (press 'K' for Anti-KYC mode)")
+        
         elif key == ord('k'):  # Toggle Anti-KYC distortion mode
+            if state.normal_mode:
+                state.normal_mode = False
+                print(f"\n[NORMAL MODE DISABLED]")
             state.anti_kyc_mode = not state.anti_kyc_mode
             if state.anti_kyc_mode:
                 print(f"\n[ANTI-KYC MODE ENABLED] - Unknown faces will be distorted (Intensity: {state.distortion_intensity}/10)")
@@ -1102,6 +1188,10 @@ except Exception as e:
 # ----------------------------
 # CLEANUP
 # ----------------------------
+# Save window settings before closing
+save_window_settings(WINDOW_NAME)
+
 cap.release()
 cv2.destroyAllWindows()
+print("[INFO] Window settings saved")
 print("[INFO] StealthZone Pro stopped")
